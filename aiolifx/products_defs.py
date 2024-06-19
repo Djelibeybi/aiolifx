@@ -1,4 +1,4 @@
-product_map = {
+product_map: dict[int, str] = {
     1: "LIFX Original 1000",
     3: "LIFX Color 650",
     10: "LIFX White 800 (Low Voltage)",
@@ -120,7 +120,7 @@ product_map = {
     206: "LIFX Indoor Neon Intl",
 }
 
-features_map = {
+features_map: dict[int, dict[str, bool | int]] = {
     1: {
         "buttons": False,
         "chain": False,

@@ -59,6 +59,26 @@ class Product:
             f"temperature_range={self.temperature_range})"
         )
 
+    def as_dict(self):
+        return {
+            "id": self.id,
+            "label": self.name,
+            "buttons": self.buttons,
+            "chain": self.chain,
+            "color": self.color,
+            "extended_multizone": self.extended_multizone,
+            "hev": self.hev,
+            "infrared": self.infrared,
+            "matrix": self.matrix,
+            "multizone": self.multizone,
+            "relays": self.relays,
+            "max_kelvin": self.max_kelvin,
+            "min_kelvin": self.min_kelvin,
+            "min_ext_mz_firmware": self.min_ext_mz_firmware,
+            "min_ext_mz_firmware_components": self.min_ext_mz_firmware_components,
+            "temperature_range": self.temperature_range
+        }
+
 
 def create_product_dict(product_map, features_map):
     products_dict = {}

@@ -3,6 +3,7 @@
 
 from .msgtypes import *
 import binascii
+import rich
 
 
 # Creates a LIFX Message out of packed binary data
@@ -405,15 +406,15 @@ def unpack_lifx_message(packed_message):
         )
 
     elif message_type == MSG_IDS[MultiZoneGetMultiZoneEffect]:  # 507
-        _, effect, _, speed, duration, _, _, _, direction, _, _ = struct.unpack(
-            "<IBHIQIIBBBB", payload_str[:31]
-        )
-        payload = {
-            "effect": effect,
-            "speed": speed,
-            "duration": duration,
-            "direction": direction,
-        }
+        # _, effect, _, speed, duration, _, _, _, direction, _, _ = struct.unpack(
+        #     "<IBHIQIIBBBB", payload_str[:31]
+        # )
+        # payload = {
+        #     "effect": effect,
+        #     "speed": speed,
+        #     "duration": duration,
+        #     "direction": direction,
+        # }
         message = MultiZoneGetMultiZoneEffect(
             target_addr, source_id, seq_num, payload, ack_requested, response_requested
         )
@@ -472,6 +473,67 @@ def unpack_lifx_message(packed_message):
         message = MultiZoneStateExtendedColorZones(
             target_addr, source_id, seq_num, payload, ack_requested, response_requested
         )
+
+    elif message_type == MSG_IDS[TileGetDeviceChain]:  # 701
+        message = TileGetDeviceChain(
+            target_addr, source_id, seq_num, payload, ack_requested, response_requested
+        )
+
+    elif message_type == MSG_IDS[TileStateDeviceChain]:  # 702
+        start_index = struct.unpack("B", payload_str[0:1])[0]
+        tile_devices_count = struct.unpack("B", payload_str[len(payload_str)-1:len(payload_str)])[0]
+
+        tile_devices = []
+        for i in range(tile_devices_count):
+            tile_devices.append(getTile(payload_str[1+(i*55):55+(i*55)]))
+
+        payload = {
+            "start_index": start_index,
+            "tile_devices": tile_devices,
+            "tile_devices_count": tile_devices_count
+        }
+        message = TileStateDeviceChain(
+            target_addr, source_id, seq_num, payload, ack_requested, response_requested
+        )
+
+    elif message_type == MSG_IDS[TileGet64]:  # 707
+        tile_index = struct.unpack("B", payload_str[0:1])[0]
+        length = struct.unpack("B", payload_str[1:2])[0]
+        x = struct.unpack("B", payload_str[3:4])[0]
+        y = struct.unpack("B", payload_str[4:5])[0]
+        width = struct.unpack("B", payload_str[5:6])[0]
+        payload = {
+            "tile_index": tile_index,
+            "length": length,
+            "x": x,
+            "y": y,
+            "width": width
+        }
+        message = TileGet64(
+            target_addr, source_id, seq_num, payload, ack_requested, response_requested
+        )
+
+    elif message_type == MSG_IDS[TileState64]:  # 711
+        tile_index = struct.unpack("B", payload_str[0:1])[0]
+        x = struct.unpack("B", payload_str[2:3])[0]
+        y = struct.unpack("B", payload_str[3:4])[0]
+        width = struct.unpack("B", payload_str[4:5])[0]
+        colors = []
+        for i in range(64):
+            color = struct.unpack("H" * 4, payload_str[5 + (i * 8) : 13 + (i * 8)])
+            colors.append(color)
+
+        payload = {
+            "tile_index": tile_index,
+            "x": x,
+            "y": y,
+            "width": width,
+            "colors": colors
+        }
+        message = TileState64(
+            target_addr, source_id, seq_num, payload, ack_requested, response_requested
+        )
+
 
     elif message_type == MSG_IDS[TileStateTileEffect]:  # 720
         instanceid = struct.unpack("I", payload_str[1:5])[0]
@@ -653,6 +715,41 @@ class ButtonTargetType(Enum):
     GROUP = 5
     SCENE = 6
     DEVICE_RELAYS = 7
+
+
+def getTile(payload_str):
+    accel_meas_x = struct.unpack("h", payload_str[0:2])[0]
+    accel_meas_y = struct.unpack("h", payload_str[2:4])[0]
+    accel_meas_z = struct.unpack("h", payload_str[4:6])[0]
+    # 6:8
+    user_x = struct.unpack("f", payload_str[8:12])[0]
+    user_y = struct.unpack("f", payload_str[12:16])[0]
+    width = struct.unpack("B", payload_str[16:17])[0]
+    height = struct.unpack("B", payload_str[17:18])[0]
+    # 18:19
+    device_version_vendor = struct.unpack("I", payload_str[19:23])[0]
+    device_version_product = struct.unpack("I", payload_str[23:27])[0]
+    # 27:31
+    firmware_build = struct.unpack("Q", payload_str[31:39])[0]
+    # 39:47
+    firmware_version_minor = struct.unpack("H", payload_str[47:49])[0]
+    firmware_version_major = struct.unpack("H", payload_str[49:51])[0]
+    # 51:55
+
+    return {
+        "accel_meas_x": accel_meas_x,
+        "accel_meas_y": accel_meas_y,
+        "accel_meas_z": accel_meas_z,
+        "user_x": user_x,
+        "user_y": user_y,
+        "width": width,
+        "height": height,
+        "device_version_vendor": device_version_vendor,
+        "device_version_product": device_version_product,
+        "firmware_build": firmware_build,
+        "firmware_version_minor": firmware_version_minor,
+        "firmware_version_major": firmware_version_major,
+    }
 
 
 def getBacklightColor(payload_str):

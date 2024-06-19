@@ -24,7 +24,7 @@
 # IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE
 import asyncio as aio
 import logging
-from typing import Any, Coroutine, Set
+from typing import Any, Coroutine, Set, Callable
 from .message import BROADCAST_MAC, BROADCAST_SOURCE_ID
 from .msgtypes import *
 from .products import *
@@ -32,6 +32,7 @@ from .unpack import unpack_lifx_message
 from functools import partial
 from math import floor
 import time, random, datetime, socket, ifaddr
+import rich
 
 # prevent tasks from being garbage collected
 _BACKGROUND_TASKS: Set[aio.Task] = set()
@@ -45,7 +46,7 @@ else:
 LISTEN_IP = "0.0.0.0"
 UDP_BROADCAST_IP = "255.255.255.255"
 UDP_BROADCAST_PORT = 56700
-DEFAULT_TIMEOUT = 0.5  # How long to wait for an ack or response
+DEFAULT_TIMEOUT = 1  # How long to wait for an ack or response
 DEFAULT_ATTEMPTS = 3  # How many time shou;d we try to send to the bulb`
 DISCOVERY_INTERVAL = 180
 DISCOVERY_STEP = 5
@@ -134,7 +135,9 @@ class Device(aio.DatagramProtocol):
         self.task = None
         self.seq = 0
         # Key is the message sequence, value is (Response, Event, callb )
-        self.message = {}
+        self.message_queue: dict[int, tuple[Message, aio.Event, Callable]] = {}
+        # Key is the message sequence, value is the number of responses expected
+        self.response_queue: dict[int, int] = {}
         self.source_id = random.randint(0, (2**32) - 1)
         # Default callback for unexpected messages
         self.default_callb = None
@@ -180,14 +183,15 @@ class Device(aio.DatagramProtocol):
         _LOGGER.debug("%s: Error received: %s", self.ip_addr, exc)
         # Clear the message queue since we know they are not going to be answered
         # and there is no point in waiting for them
-        for entry in self.message.values():
+        for entry in self.message_queue.values():
             response_type, myevent, callb = entry
             if response_type != Acknowledgement:
                 if callb:
                     callb(self, None)
                 if myevent:
                     myevent.set()
-        self.message.clear()
+        self.message_queue.clear()
+        self.response_queue.clear()
 
     def datagram_received(self, data, addr):
         """Method run when data is received from the device
@@ -206,9 +210,20 @@ class Device(aio.DatagramProtocol):
         self.register()
         response = unpack_lifx_message(data)
         self.lastmsg = datetime.datetime.now()
-        if response.seq_num in self.message:
-            response_type, myevent, callb = self.message[response.seq_num]
-            if type(response) == response_type:
+        _LOGGER.debug("Received response with seq_num: %s", response.seq_num)
+        if response.seq_num in self.message_queue:
+            _LOGGER.debug("Found matching request for seq_num: %s", response.seq_num)
+            response_type, myevent, callb = self.message_queue[response.seq_num]
+            if response.seq_num in self.response_queue:
+                self.response_queue[response.seq_num] = (
+                    self.response_queue[response.seq_num] - 1
+                )
+                _LOGGER.debug(
+                    "Remaining responses for message %s: %s",
+                    response.seq_num,
+                    self.response_queue[response.seq_num],
+                )
+            if isinstance(response, response_type):
                 if response.source_id == self.source_id:
                     if "State" in response.__class__.__name__:
                         setmethod = (
@@ -216,16 +231,22 @@ class Device(aio.DatagramProtocol):
                             + response.__class__.__name__.replace("State", "").lower()
                         )
                         method = getattr(self, setmethod, None)
+                        _LOGGER.debug("Looking for %s callback method", method)
                         if method:
                             method(response)
                     if callb:
                         callb(self, response)
                     myevent.set()
-                del self.message[response.seq_num]
+                if self.response_queue[response.seq_num] == 0:
+                    _LOGGER.debug(
+                        "Removing message from response queue: %s", response.seq_num
+                    )
+                    del self.message_queue[response.seq_num]
+                    del self.response_queue[response.seq_num]
             elif type(response) == Acknowledgement:
                 pass
             else:
-                del self.message[response.seq_num]
+                del self.message_queue[response.seq_num]
         elif self.default_callb:
             self.default_callb(response)
 
@@ -334,10 +355,10 @@ class Device(aio.DatagramProtocol):
 
         attempts = 0
         while attempts < max_attempts:
-            if msg.seq_num not in self.message:
+            if msg.seq_num not in self.message_queue:
                 return
             event = aio.Event()
-            self.message[msg.seq_num][1] = event
+            self.message_queue[msg.seq_num][1] = event
             attempts += 1
             if self.transport:
                 self.transport.sendto(msg.packed_message)
@@ -345,13 +366,13 @@ class Device(aio.DatagramProtocol):
                 async with asyncio_timeout(timeout_secs):
                     await event.wait()
                 break
-            except Exception as inst:
+            except Exception:
                 if attempts >= max_attempts:
-                    if msg.seq_num in self.message:
-                        callb = self.message[msg.seq_num][2]
+                    if msg.seq_num in self.message_queue:
+                        callb = self.message_queue[msg.seq_num][2]
                         if callb:
                             callb(self, None)
-                        del self.message[msg.seq_num]
+                        del self.message_queue[msg.seq_num]
                     # It's dead Jim
                     self.unregister()
 
@@ -382,7 +403,7 @@ class Device(aio.DatagramProtocol):
             ack_requested=True,
             response_requested=False,
         )
-        self.message[msg.seq_num] = [Acknowledgement, None, callb]
+        self.message_queue[msg.seq_num] = [Acknowledgement, None, callb]
         _create_background_task(self.try_sending(msg, timeout_secs, max_attempts))
         return True
 
@@ -395,6 +416,7 @@ class Device(aio.DatagramProtocol):
         callb=None,
         timeout_secs=None,
         max_attempts=None,
+        response_count=1,
     ):
         """Method to send a message expecting to receive a response.
 
@@ -421,7 +443,9 @@ class Device(aio.DatagramProtocol):
             ack_requested=False,
             response_requested=True,
         )
-        self.message[msg.seq_num] = [response_type, None, callb]
+
+        self.message_queue[msg.seq_num] = [response_type, None, callb]
+        self.response_queue[msg.seq_num] = response_count
         _create_background_task(self.try_sending(msg, timeout_secs, max_attempts))
         return True
 
@@ -458,7 +482,7 @@ class Device(aio.DatagramProtocol):
             ack_requested=True,
             response_requested=True,
         )
-        self.message[msg.seq_num] = [response_type, None, callb]
+        self.message_queue[msg.seq_num] = [response_type, None, callb]
         _create_background_task(self.try_sending(msg, timeout_secs, max_attempts))
         return True
 
@@ -918,6 +942,12 @@ class Light(Device):
         self.hev_cycle_configuration = None
         self.last_hev_cycle_result = None
         self.effect = {"effect": None}
+        # matrix devices: Tile, Candle, Path, Spot, Ceiling
+        self.chain = {}
+        self.chain_length = 0
+        self.tile_devices = []
+        self.tile_devices_count = 0
+        self.tile_device_width = 0
         # Only used by a Lifx Switch. Will be populated with either True or False for each relay index if `get_rpower` called.
         # At the moment we assume the switch to be 4 relays. This will likely work with the 2 relays switch as well, but only the first two values
         # in this array will contain useful data.
@@ -1611,6 +1641,55 @@ class Light(Device):
         if resp:
             self.last_hev_cycle_result = LAST_HEV_CYCLE_RESULT.get(resp.result)
 
+    def tile_get_device_chain(self, callb=None):
+        """Convenience method to get the devices on a matrix chain."""
+        if products_dict[self.product].matrix is True:
+            self.req_with_resp(TileGetDeviceChain, TileStateDeviceChain, callb=callb)
+
+    def resp_set_tiledevicechain(self, resp):
+        if resp:
+            self.tile_devices = [tile_device for tile_device in resp.tile_devices]
+            self.tile_devices_count = resp.tile_devices_count
+            self.tile_device_width = self.tile_devices[0]["width"]
+
+    def tile_get64(self, tile_index=0, length=1, x=0, y=0, callb=None):
+        """Convenience method to get the current state of a tile in a chain."""
+
+        if products_dict[self.product].matrix is False or self.tile_device_width == 0:
+            return
+
+        if products_dict[self.product].chain is True:
+            length = 5
+
+        # if self.product in [55, 176, 177]:
+        #     width = 8
+        # elif self.product in [57, 68, 81, 96, 137, 138, 185, 186, 187, 188]:
+        #     width = 5
+        # else:
+        #     width = 3
+
+
+        args = {
+            "tile_index": tile_index,
+            "length": length,
+            "x": x,
+            "y": y,
+            "width": self.tile_device_width,
+        }
+
+        self.req_with_resp(
+            msg_type=TileGet64,
+            response_type=TileState64,
+            payload=args,
+            callb=callb,
+            response_count=length,
+        )
+
+    def resp_set_tile64(self, resp):
+        if resp and isinstance(resp, TileState64):
+            self.chain[resp.tile_index] = resp.colors
+            self.chain_length = len(self.chain)
+
     def get_tile_effect(self, callb=None):
         """Convenience method to get the currently running effect on a Tile or Candle.
 
@@ -2022,32 +2101,32 @@ class LifxDiscovery(aio.DatagramProtocol):
     ):
         self.lights = {}  # Known devices indexed by mac addresses
         self.parent = parent  # Where to register new devices
-        self.transport = None
-        self.loop = loop
-        self.task = None
-        self.source_id = random.randint(0, (2**32) - 1)
-        self.ipv6prefix = ipv6prefix
-        self.discovery_interval = discovery_interval
-        self.discovery_step = discovery_step
-        self.discovery_countdown = 0
-        self.broadcast_ip = broadcast_ip
+        self.transport: aio.DatagramTransport = None
+        self.loop: aio.AbstractEventLoop = loop
+        self.task: aio.Task = None
+        self.source_id: int = random.randint(0, (2**32) - 1)
+        self.ipv6prefix: str = ipv6prefix
+        self.discovery_interval: int = discovery_interval
+        self.discovery_step: int = discovery_step
+        self.discovery_countdown: int = 0
+        self.broadcast_ip: str = broadcast_ip
 
     def start(self, listen_ip=LISTEN_IP, listen_port=0):
         """Start discovery task."""
         coro = self.loop.create_datagram_endpoint(
             lambda: self, local_addr=(listen_ip, listen_port)
         )
-
         self.task = aio.create_task(coro)
+        _LOGGER.info("Started discovery task: %s", self.task.get_name())
         return self.task
 
-    def connection_made(self, transport):
+    def connection_made(self, transport: aio.DatagramTransport):
         """Method run when the UDP broadcast server is started"""
-        # print('started')
         self.transport = transport
-        sock = self.transport.get_extra_info("socket")
+        sock: socket.socket = self.transport.get_extra_info("socket")
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        _LOGGER.info("Started listening on: %s", sock.getsockname())
         self.loop.call_soon(self.discover)
 
     def datagram_received(self, data, addr):
@@ -2062,21 +2141,25 @@ class LifxDiscovery(aio.DatagramProtocol):
             :param addr: sender IP address 2-tuple for IPv4, 4-tuple for IPv6
             :type addr: tuple
         """
-        response = unpack_lifx_message(data)
-        response.ip_addr = addr[0]
+        response: Message = unpack_lifx_message(data)
+        ip_addr = addr[0]
 
-        mac_addr = response.target_addr
+        mac_addr: str = response.target_addr
         if mac_addr == BROADCAST_MAC:
             return
 
         if (
-            type(response) == StateService and response.service == 1
+            isinstance(response, StateService) and response.service == 1
         ):  # only look for UDP services
             # discovered
             remote_port = response.port
-        elif type(response) == LightState:
+            _LOGGER.debug(
+                "Received discovery response from: %s:%s", ip_addr, response.port
+            )
+        elif isinstance(response, LightState):
             # looks like the lights are volunteering LigthState after booting
             remote_port = UDP_BROADCAST_PORT
+            _LOGGER.debug("Received LightState from: %s", ip_addr)
         else:
             return
 
@@ -2085,7 +2168,7 @@ class LifxDiscovery(aio.DatagramProtocol):
             remote_ip = mac_to_ipv6_linklocal(mac_addr, self.ipv6prefix)
         else:
             family = socket.AF_INET
-            remote_ip = response.ip_addr
+            remote_ip = ip_addr
 
         if mac_addr in self.lights:
             # rediscovered
